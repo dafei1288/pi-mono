@@ -1,0 +1,13 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+	test: {
+		include: ["test/**/*.test.ts"],
+		environment: "node",
+		server: {
+			deps: {
+				external: [/^node:/, "ws", /@mariozechner\/pi-coding-agent/],
+			},
+		},
+	},
+});

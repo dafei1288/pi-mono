@@ -1,0 +1,20 @@
+{
+  "name": "pi — remote coding agent",
+  "short_name": "pi",
+  "description": "Remote vibe coding with pi agent on your phone",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["developer tools", "productivity"],
+  "prefer_related_applications": false
+}
