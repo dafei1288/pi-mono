@@ -93,6 +93,7 @@ export class MobileServer {
 	private lastBroadcastHash = "";
 	private watchDebounce: ReturnType<typeof setTimeout> | null = null;
 	private watchedSessionDir: string | null = null;
+	private watchedSessionFile: string | null = null;
 	private authManager: AuthManager;
 	private connections = new Map<string, ClientConnection>();
 	private seq = 0;
@@ -294,6 +295,7 @@ export class MobileServer {
 			this.sessionWatcher = null;
 		}
 		this.watchedSessionDir = null;
+		this.watchedSessionFile = null;
 		this.lastBroadcastHash = "";
 	}
 
@@ -301,25 +303,32 @@ export class MobileServer {
 		this.stopSessionWatcher();
 		if (!this.bridge?.isRunning) return;
 
-		// Get session file path from agent state
+		// Get session file path from agent state (retry a few times, agent may still be initializing)
 		let sessionFile: string | undefined;
-		try {
-			const stateResp = await this.bridge.getState();
-			if (stateResp.success && stateResp.data) {
-				const state = stateResp.data as Record<string, unknown>;
-				sessionFile = state.sessionFile as string | undefined;
-			}
-		} catch {
+		for (let attempt = 0; attempt < 5; attempt++) {
+			try {
+				const stateResp = await this.bridge.getState();
+				if (stateResp.success && stateResp.data) {
+					const state = stateResp.data as Record<string, unknown>;
+					sessionFile = state.sessionFile as string | undefined;
+					if (sessionFile) break;
+				}
+			} catch {}
+			await new Promise((r) => setTimeout(r, 1000));
+		}
+		if (!sessionFile) {
+			console.log("[pi-mobile-server] Could not get session file path, skipping watcher");
 			return;
 		}
-		if (!sessionFile) return;
 
 		// Store the session file path for direct file reading
 		this.watchedSessionDir = dirname(sessionFile);
+		this.watchedSessionFile = sessionFile;
 
 		try {
 			// Watch the directory — session file gets replaced on rotation
 			this.sessionWatcher = watch(this.watchedSessionDir, (_eventType, filename) => {
+				
 				if (filename?.endsWith(".jsonl")) {
 					this.onSessionFileChange();
 				}
@@ -342,63 +351,67 @@ export class MobileServer {
 
 	private async broadcastMessageSync(): Promise<void> {
 		if (!this.watchedSessionDir) return;
-		// Skip if our own agent is actively streaming — avoid clobbering real-time events
 		if (this.agentStreaming) return;
 		try {
-			// Read the session files directly — this picks up changes from CLI or other agents
 			const msgs = await this.readSessionMessages(this.watchedSessionDir);
+			console.log(`[pi-mobile-server] readSessionMessages returned ${msgs.length} msgs`);
 			if (msgs.length === 0) return;
 
-			// Hash to avoid redundant broadcasts
 			const hash = `${msgs.length}:${msgs[msgs.length - 1]?.content?.slice?.(0, 20) ?? msgs.length}`;
 			if (hash === this.lastBroadcastHash) return;
 			this.lastBroadcastHash = hash;
 
 			this.broadcastEvent("message_history", { messages: msgs });
 			console.log(`[pi-mobile-server] Session file changed, synced ${msgs.length} messages`);
-		} catch {
-			/* ignore */
+		} catch (err) {
+			console.log(`[pi-mobile-server] broadcastMessageSync error: ${err}`);
 		}
 	}
 
 	/** Read all user/assistant messages from session jsonl files in a directory. */
-	private async readSessionMessages(dir: string): Promise<Array<{ role: string; content: string }>> {
-		const entries = await readdir(dir);
-		const jsonlFiles = entries.filter((f) => f.endsWith(".jsonl")).sort();
-		if (jsonlFiles.length === 0) return [];
+	private async readSessionMessages(_dir: string): Promise<Array<{ role: string; content: string }>> {
+		// Read the most recently modified session file (CLI may use a different one than our agent)
+		const dir = this.watchedSessionDir;
+		if (!dir) return [];
+		let target: string | undefined;
+		try {
+			const entries = await readdir(dir);
+			const jsonlFiles = entries.filter((f) => f.endsWith(".jsonl"));
+			if (jsonlFiles.length === 0) return [];
+			// Find the most recently modified file
+			let latestTime = 0;
+			for (const f of jsonlFiles) {
+				const s = await stat(join(dir, f));
+				if (s.mtimeMs > latestTime) { latestTime = s.mtimeMs; target = join(dir, f); }
+			}
+		} catch { return []; }
+		if (!target) return [];
 
-		// Read the most recent session file
-		const latest = jsonlFiles[jsonlFiles.length - 1];
-		const content = await readFile(join(dir, latest), "utf8");
+		let content: string;
+		try {
+			content = await readFile(target, "utf8");
+		} catch {
+			return [];
+		}
 		const lines = content.split("\n").filter((l) => l.trim());
+
+		const extractText = (c: unknown): string => {
+			if (typeof c === "string") return c;
+			if (Array.isArray(c)) return c.filter((x: any) => x.type === "text").map((x: any) => x.text).join("");
+			return "";
+		};
 
 		const messages: Array<{ role: string; content: string }> = [];
 		for (const line of lines) {
 			try {
 				const entry = JSON.parse(line);
-				if (entry.role === "user") {
-					const text =
-						typeof entry.content === "string"
-							? entry.content
-							: Array.isArray(entry.content)
-								? entry.content
-										.filter((c: any) => c.type === "text")
-										.map((c: any) => c.text)
-										.join("")
-								: "";
-					if (text) messages.push({ role: "user", content: text });
-				} else if (entry.role === "assistant") {
-					const text =
-						typeof entry.content === "string"
-							? entry.content
-							: Array.isArray(entry.content)
-								? entry.content
-										.filter((c: any) => c.type === "text")
-										.map((c: any) => c.text)
-										.join("")
-								: "";
-					if (text) messages.push({ role: "assistant", content: text });
-				}
+				// Format 1: {type: "message", message: {role, content}} — pi session format
+				// Format 2: {role: "user"/"assistant", content} — simple format
+				const msg = entry.type === "message" && entry.message ? entry.message : entry;
+				const role = msg.role as string | undefined;
+				if (role !== "user" && role !== "assistant") continue;
+				const text = extractText(msg.content);
+				if (text) messages.push({ role, content: text });
 			} catch {}
 		}
 		return messages;

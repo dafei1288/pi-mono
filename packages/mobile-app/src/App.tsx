@@ -288,6 +288,7 @@ export default function App() {
 	const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const reconnectAttemptsRef = useRef(0);
 	const intentionalDisconnectRef = useRef(false);
+	const connectedRef = useRef(false);
 
 	// Same-origin auto-detect
 	const sameOrigin = typeof window !== "undefined" && !window.location.protocol.startsWith("file") && window.location.port !== "19023" && window.location.hostname !== "";
@@ -402,11 +403,20 @@ export default function App() {
 		} catch {}
 	}, [activeProject]);
 
+	// ---- Stop auto-reconnect (called when user edits input) ----
+	const stopReconnect = useCallback(() => {
+		intentionalDisconnectRef.current = true;
+		if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
+		setError(""); setLoading("");
+	}, []);
+
 	// ---- Connect ----
 	const connect = useCallback(async (overrideUrl?: string) => {
 		const url = overrideUrl ?? serverUrl;
 		if (!url.trim()) return;
-		setServerUrl(url); setError(""); setLoading("Connecting..."); intentionalDisconnectRef.current = false;
+		// Only update the input field on first connect (not during auto-reconnect)
+		if (!connectedRef.current) setServerUrl(url);
+		setError(""); setLoading("Connecting..."); intentionalDisconnectRef.current = false;
 		if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
 		try {
 			const ws = new WebSocket(url.startsWith("ws") ? url : `ws://${url}`);
@@ -416,7 +426,7 @@ export default function App() {
 					await rpc("connect", { client: { name: "pi-mobile", version: "1", platform: "web", mode: "mobile" } });
 					const res = await rpc("list_projects");
 					setProjects(res.projects ?? []); setActiveProject(res.activeProject ?? ""); setActiveCwd(res.activeCwd ?? "");
-					setLoading(""); addServer(url); setSavedServers(loadServers()); setConnected(true);
+					setLoading(""); addServer(url); setSavedServers(loadServers()); setConnected(true); connectedRef.current = true;
 				} catch (err) { setError(String(err)); setLoading(""); }
 			};
 			ws.onmessage = (e) => handleWsMessage(typeof e.data === "string" ? e.data : "");
@@ -428,7 +438,7 @@ export default function App() {
 					reconnectAttemptsRef.current++;
 					setError(`Disconnected. Reconnecting in ${Math.round(delay / 1000)}s...`);
 					reconnectRef.current = setTimeout(() => connect(url), delay);
-				} else { setConnected(false); }
+				} else { setConnected(false); connectedRef.current = false; }
 			};
 		} catch (err) { setError(String(err)); setLoading(""); }
 	}, [serverUrl, rpc, handleWsMessage]);
@@ -438,7 +448,22 @@ export default function App() {
 		setError(""); setLoading("Starting agent..."); setShowProjectPicker(false); setShowBrowser(false);
 		try {
 			const res = await rpc("select_project", { path });
-			setActiveProject(res.project ?? ""); setActiveCwd(res.cwd ?? ""); setMessages([]); setStreamingText(""); setConnected(true);
+			setActiveProject(res.project ?? ""); setActiveCwd(res.cwd ?? ""); setConnected(true); connectedRef.current = true;
+			// After project loads, list sessions for user to pick
+			try {
+				const sessRes = await rpc("list_sessions");
+				const sessList = sessRes.sessions ?? [];
+				if (sessList.length > 0) {
+					setSessions(sessList);
+					setCurrentSessionId(sessRes.currentSessionId ?? "");
+					setShowSessions(true);
+					setMessages([]); setStreamingText("");
+				} else {
+					setMessages([]); setStreamingText("");
+				}
+			} catch {
+				setMessages([]); setStreamingText("");
+			}
 		} catch (err) { setError(String(err)); }
 		setLoading("");
 	}, [rpc]);
@@ -485,7 +510,7 @@ export default function App() {
 		intentionalDisconnectRef.current = true;
 		if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
 		wsRef.current?.close(); wsRef.current = null;
-		setConnected(false); setMessages([]); setStreamingText(""); setProjects([]); setActiveProject(""); setIsStreaming(false); setError("");
+		setConnected(false); connectedRef.current = false; setMessages([]); setStreamingText(""); setProjects([]); setActiveProject(""); setIsStreaming(false); setError("");
 	}, []);
 
 	// =====================================================================
@@ -506,7 +531,7 @@ export default function App() {
 						<TouchableOpacity style={s.actionBtn} onPress={() => setShowQR(true)}><Text style={s.actionBtnIcon}>📷</Text><Text style={s.actionBtnLabel}>Scan QR</Text></TouchableOpacity>
 						<TouchableOpacity style={s.actionBtn} onPress={async () => { setShowDiscovery(true); setDiscoveredServers([]); setScanningNetwork(true); await scanSubnet(18790, (srv) => setDiscoveredServers((p) => p.some((s) => s.ip === srv.ip && s.port === srv.port) ? p : [...p, srv])); setScanningNetwork(false); }}><Text style={s.actionBtnIcon}>📡</Text><Text style={s.actionBtnLabel}>Discover</Text></TouchableOpacity>
 					</View>
-					<TextInput style={s.input} value={serverUrl} onChangeText={setServerUrl} placeholder="Server address (e.g. 192.168.1.100:18790)" placeholderTextColor="#555" autoCapitalize="none" autoCorrect={false} editable={!loading} onSubmitEditing={() => connect()} />
+					<TextInput style={s.input} value={serverUrl} onChangeText={(v: string) => { setServerUrl(v); stopReconnect(); }} placeholder="Server address (e.g. 192.168.1.100:18790)" placeholderTextColor="#555" autoCapitalize="none" autoCorrect={false} editable={!loading} onSubmitEditing={() => connect()} />
 					<TouchableOpacity style={s.btnPrimary} onPress={() => connect()} disabled={!!loading}>
 						{loading ? <ActivityIndicator color="#0a0a0a" /> : <Text style={s.btnPrimaryText}>Connect</Text>}
 					</TouchableOpacity>
@@ -649,9 +674,12 @@ export default function App() {
 			{showSessions && (
 				<TouchableOpacity style={s.overlayBg} activeOpacity={1} onPress={() => setShowSessions(false)}>
 					<View style={s.overlayPanel} onStartShouldSetResponder={() => true}>
-						<View style={s.overlayHeader}><Text style={s.overlayTitle}>Resume Session</Text><TouchableOpacity onPress={() => setShowSessions(false)}><Text style={s.overlayClose}>✕</Text></TouchableOpacity></View>
-						<ScrollView style={{ padding: 8, maxHeight: "70%" }}>
-							{sessions.length === 0 && <Text style={{ color: "#888", textAlign: "center", paddingVertical: 20 }}>No sessions found</Text>}
+						<View style={s.overlayHeader}><Text style={s.overlayTitle}>Sessions</Text><TouchableOpacity onPress={() => setShowSessions(false)}><Text style={s.overlayClose}>✕</Text></TouchableOpacity></View>
+						<TouchableOpacity style={s.newSessionBtn} onPress={async () => { setShowSessions(false); try { await rpc("new_session"); setMessages([]); setStreamingText(""); } catch (err) { setError(String(err)); } }}>
+							<Text style={s.newSessionBtnText}>✨ New Session</Text>
+						</TouchableOpacity>
+						<ScrollView style={{ padding: 8, maxHeight: "60%" }}>
+							{sessions.length === 0 && <Text style={{ color: "#888", textAlign: "center", paddingVertical: 20 }}>No previous sessions</Text>}
 							{sessions.map((sess) => (
 								<TouchableOpacity key={sess.path} style={[s.sessionItem, sess.path.includes(currentSessionId) && s.sessionItemActive]} onPress={() => switchSession(sess.path)}>
 									<View style={{ flex: 1, marginRight: 8 }}>
@@ -805,4 +833,6 @@ const s = StyleSheet.create({
 	// Session
 	sessionItem: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 8, marginBottom: 4, backgroundColor: "#2a2a2a" },
 	sessionItemActive: { backgroundColor: "#1a2a3a", borderWidth: 2, borderColor: "#4a9eff" },
+	newSessionBtn: { marginHorizontal: 8, marginVertical: 6, backgroundColor: "#4a9eff", borderRadius: 8, paddingVertical: 10, alignItems: "center" },
+	newSessionBtnText: { color: "#0a0a0a", fontSize: 14, fontWeight: "700" },
 });
