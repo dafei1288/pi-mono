@@ -41,6 +41,7 @@ const { values } = parseArgs({
 		provider: { type: "string" },
 		model: { type: "string", short: "m" },
 		cwd: { type: "string" },
+		"projects-file": { type: "string" },
 		"no-mdns": { type: "boolean", default: false },
 		help: { type: "boolean", short: "?", default: false },
 	},
@@ -65,6 +66,7 @@ Options:
   --provider <provider>   LLM provider (e.g. anthropic, openai)
   -m, --model <model>     Model ID
   --cwd <path>            Default project directory (agent starts immediately)
+  --projects-file <path>  JSON file listing project paths (array of strings or objects)
   --no-mdns               Disable mDNS auto-discovery
   -?, --help              Show this help
 
@@ -94,6 +96,7 @@ const server = new MobileServer({
 	host: values.host,
 	auth: values.password ? { password: values.password } : undefined,
 	defaultCwd: values.cwd,
+	projectsFile: values["projects-file"],
 	agent: {
 		provider: values.provider,
 		model: values.model,
@@ -125,16 +128,18 @@ server
 	.start()
 	.then(async () => {
 		const wsUrl = `${localIP}:${port}`;
+		const webStatus = server.status.hasWebUI ? `http://${wsUrl}` : "not built";
 
 		console.log("");
 		console.log("  ┌──────────────────────────────────────────┐");
 		console.log("  │  pi-mobile-server                        │");
 		console.log("  │                                          │");
 		console.log(`  │  Address:  ${wsUrl.padEnd(30)}│`);
+		console.log(`  │  Web UI:   ${webStatus.padEnd(30)}│`);
 		console.log(`  │  Auth:     ${(server.status.authRequired ? "password" : "none").padEnd(30)}│`);
 		console.log(`  │  Project:  ${(server.status.activeCwd ?? "none").padEnd(30)}│`);
 		console.log("  │                                          │");
-		console.log("  │  Scan QR code or enter address in app:   │");
+		console.log("  │  Open browser or scan QR code:           │");
 		console.log("  └──────────────────────────────────────────┘");
 		console.log("");
 

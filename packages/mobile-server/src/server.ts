@@ -13,10 +13,12 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { existsSync, type FSWatcher, watch } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer, type WebSocket as WsType } from "ws";
 import { AuthManager } from "./auth.js";
 import { RpcBridge } from "./bridge.js";
@@ -57,6 +59,10 @@ export interface MobileServerOptions {
 	};
 	/** Enable mDNS discovery. Default: true */
 	mdns?: boolean;
+	/** Directory containing static web files to serve (e.g. mobile-app dist). */
+	webDir?: string;
+	/** JSON file listing project paths. */
+	projectsFile?: string;
 }
 
 interface ClientConnection {
@@ -82,12 +88,18 @@ export class MobileServer {
 	private bridge: RpcBridge | null = null;
 	private activeProject: string | null = null;
 	private activeCwd: string | null = null;
+	private agentStreaming = false;
+	private sessionWatcher: FSWatcher | null = null;
+	private lastBroadcastHash = "";
+	private watchDebounce: ReturnType<typeof setTimeout> | null = null;
+	private watchedSessionDir: string | null = null;
 	private authManager: AuthManager;
 	private connections = new Map<string, ClientConnection>();
 	private seq = 0;
 	private options: Required<Pick<MobileServerOptions, "port" | "host">> & Omit<MobileServerOptions, "port" | "host">;
 	private agentDefaults: NonNullable<MobileServerOptions["agent"]>;
 	private mdnsService: any = null;
+	private webDir: string | null;
 
 	constructor(options: MobileServerOptions = {}) {
 		this.options = {
@@ -97,10 +109,42 @@ export class MobileServer {
 			defaultCwd: options.defaultCwd,
 			agent: options.agent,
 			mdns: options.mdns,
+			projectsFile: options.projectsFile,
 		};
 
 		this.agentDefaults = options.agent ?? {};
 		this.authManager = new AuthManager(this.options.auth ?? {});
+
+		// Resolve webDir
+		if (options.webDir) {
+			this.webDir = resolve(options.webDir);
+		} else {
+			// Auto-detect: try multiple strategies
+			const candidates = [
+				// 1. Relative to this source file (packages/mobile-server/src/)
+				() => {
+					try {
+						return resolve(dirname(fileURLToPath(import.meta.url)), "../../mobile-app/dist");
+					} catch {
+						return null;
+					}
+				},
+				// 2. Relative to cwd
+				() => resolve(process.cwd(), "packages/mobile-app/dist"),
+				// 3. Sibling of this package
+				() => resolve(process.cwd(), "../mobile-app/dist"),
+			];
+			this.webDir = null;
+			for (const fn of candidates) {
+				try {
+					const dir = fn();
+					if (dir && existsSync(dir)) {
+						this.webDir = dir;
+						break;
+					}
+				} catch {}
+			}
+		}
 
 		// HTTP server
 		this.httpServer = createServer((req, res) => this.handleHttpRequest(req, res));
@@ -156,6 +200,7 @@ export class MobileServer {
 		this.stopMdns();
 
 		if (this.bridge) {
+			this.stopSessionWatcher();
 			await this.bridge.stop();
 			this.bridge = null;
 		}
@@ -171,6 +216,7 @@ export class MobileServer {
 		activeCwd: string | null;
 		authRequired: boolean;
 		port: number;
+		hasWebUI: boolean;
 	} {
 		return {
 			running: this.httpServer.listening,
@@ -181,6 +227,7 @@ export class MobileServer {
 			activeCwd: this.activeCwd,
 			authRequired: this.authManager.requiresAuth,
 			port: this.options.port,
+			hasWebUI: this.webDir !== null,
 		};
 	}
 
@@ -192,6 +239,7 @@ export class MobileServer {
 		// Stop existing agent if any
 		if (this.bridge) {
 			console.log(`[pi-mobile-server] Stopping current agent (was: ${this.activeCwd})`);
+			this.stopSessionWatcher();
 			await this.bridge.stop();
 			this.bridge = null;
 
@@ -227,6 +275,133 @@ export class MobileServer {
 			project: this.activeProject,
 			cwd: this.activeCwd,
 		});
+
+		// Watch session file for external changes (e.g. CLI chatting in same project)
+		this.startSessionWatcher();
+	}
+
+	// -----------------------------------------------------------------------
+	// Session file watcher — syncs messages from CLI / external processes
+	// -----------------------------------------------------------------------
+
+	private stopSessionWatcher(): void {
+		if (this.watchDebounce) {
+			clearTimeout(this.watchDebounce);
+			this.watchDebounce = null;
+		}
+		if (this.sessionWatcher) {
+			this.sessionWatcher.close();
+			this.sessionWatcher = null;
+		}
+		this.watchedSessionDir = null;
+		this.lastBroadcastHash = "";
+	}
+
+	private async startSessionWatcher(): Promise<void> {
+		this.stopSessionWatcher();
+		if (!this.bridge?.isRunning) return;
+
+		// Get session file path from agent state
+		let sessionFile: string | undefined;
+		try {
+			const stateResp = await this.bridge.getState();
+			if (stateResp.success && stateResp.data) {
+				const state = stateResp.data as Record<string, unknown>;
+				sessionFile = state.sessionFile as string | undefined;
+			}
+		} catch {
+			return;
+		}
+		if (!sessionFile) return;
+
+		// Store the session file path for direct file reading
+		this.watchedSessionDir = dirname(sessionFile);
+
+		try {
+			// Watch the directory — session file gets replaced on rotation
+			this.sessionWatcher = watch(this.watchedSessionDir, (_eventType, filename) => {
+				if (filename?.endsWith(".jsonl")) {
+					this.onSessionFileChange();
+				}
+			});
+			this.sessionWatcher.on("error", () => {});
+			console.log(`[pi-mobile-server] Watching session dir: ${this.watchedSessionDir}`);
+		} catch {
+			/* watcher not available */
+		}
+	}
+
+	private onSessionFileChange(): void {
+		// Debounce: coalesce rapid writes into one broadcast
+		if (this.watchDebounce) return;
+		this.watchDebounce = setTimeout(() => {
+			this.watchDebounce = null;
+			this.broadcastMessageSync();
+		}, 500);
+	}
+
+	private async broadcastMessageSync(): Promise<void> {
+		if (!this.watchedSessionDir) return;
+		// Skip if our own agent is actively streaming — avoid clobbering real-time events
+		if (this.agentStreaming) return;
+		try {
+			// Read the session files directly — this picks up changes from CLI or other agents
+			const msgs = await this.readSessionMessages(this.watchedSessionDir);
+			if (msgs.length === 0) return;
+
+			// Hash to avoid redundant broadcasts
+			const hash = `${msgs.length}:${msgs[msgs.length - 1]?.content?.slice?.(0, 20) ?? msgs.length}`;
+			if (hash === this.lastBroadcastHash) return;
+			this.lastBroadcastHash = hash;
+
+			this.broadcastEvent("message_history", { messages: msgs });
+			console.log(`[pi-mobile-server] Session file changed, synced ${msgs.length} messages`);
+		} catch {
+			/* ignore */
+		}
+	}
+
+	/** Read all user/assistant messages from session jsonl files in a directory. */
+	private async readSessionMessages(dir: string): Promise<Array<{ role: string; content: string }>> {
+		const entries = await readdir(dir);
+		const jsonlFiles = entries.filter((f) => f.endsWith(".jsonl")).sort();
+		if (jsonlFiles.length === 0) return [];
+
+		// Read the most recent session file
+		const latest = jsonlFiles[jsonlFiles.length - 1];
+		const content = await readFile(join(dir, latest), "utf8");
+		const lines = content.split("\n").filter((l) => l.trim());
+
+		const messages: Array<{ role: string; content: string }> = [];
+		for (const line of lines) {
+			try {
+				const entry = JSON.parse(line);
+				if (entry.role === "user") {
+					const text =
+						typeof entry.content === "string"
+							? entry.content
+							: Array.isArray(entry.content)
+								? entry.content
+										.filter((c: any) => c.type === "text")
+										.map((c: any) => c.text)
+										.join("")
+								: "";
+					if (text) messages.push({ role: "user", content: text });
+				} else if (entry.role === "assistant") {
+					const text =
+						typeof entry.content === "string"
+							? entry.content
+							: Array.isArray(entry.content)
+								? entry.content
+										.filter((c: any) => c.type === "text")
+										.map((c: any) => c.text)
+										.join("")
+								: "";
+					if (text) messages.push({ role: "assistant", content: text });
+				}
+			} catch {}
+		}
+		return messages;
 	}
 
 	private subscribeClientToAgent(conn: ClientConnection): void {
@@ -294,6 +469,31 @@ export class MobileServer {
 		} catch {
 			// No config yet
 		}
+
+		// Merge projects from --projects-file
+		if (this.options.projectsFile) {
+			try {
+				const raw = await readFile(this.options.projectsFile, "utf8");
+				const entries = JSON.parse(raw);
+				if (!Array.isArray(entries)) return saved;
+				for (const entry of entries) {
+					const p =
+						typeof entry === "string"
+							? { name: basename(resolve(entry)), path: resolve(entry) }
+							: {
+									name: entry.name || basename(resolve(entry.path)),
+									path: resolve(entry.path),
+									description: entry.description,
+								};
+					if (!saved.some((s) => resolve(s.path) === p.path)) {
+						saved.push(p);
+					}
+				}
+			} catch (err) {
+				console.error(`[pi-mobile-server] Failed to load projects file: ${err}`);
+			}
+		}
+
 		return saved;
 	}
 
@@ -376,6 +576,9 @@ export class MobileServer {
 		}
 		if (method === "list_sessions") {
 			return this.handleListSessions(conn, id, params);
+		}
+		if (method === "browse_directory") {
+			return this.handleBrowseDirectory(conn, id, params);
 		}
 
 		// Agent methods — require an active agent
@@ -618,8 +821,32 @@ export class MobileServer {
 	}
 
 	// -----------------------------------------------------------------------
-	// Connect handler (auth + subscribe to agent events)
+	// Directory browsing handler
 	// -----------------------------------------------------------------------
+
+	private async handleBrowseDirectory(conn: ClientConnection, id: string, params?: unknown): Promise<void> {
+		const p = params as { path?: string } | undefined;
+		const dirPath = p?.path || homedir();
+		try {
+			const resolved = resolve(dirPath);
+			const entries = await readdir(resolved, { withFileTypes: true });
+			const dirs = entries
+				.filter((e) => e.isDirectory() && !e.name.startsWith("."))
+				.map((e) => {
+					// Check if it's a git repo
+					const subPath = join(resolved, e.name);
+					const isGit = existsSync(join(subPath, ".git"));
+					return { name: e.name, path: subPath, isGit };
+				});
+			this.sendResponse(conn, id, true, {
+				path: resolved,
+				parent: resolved === resolve("/") ? resolved : join(resolved, ".."),
+				entries: dirs,
+			});
+		} catch (err) {
+			this.sendError(conn, id, "internal", String(err));
+		}
+	}
 
 	private async handleConnect(conn: ClientConnection, id: string, params?: ConnectParams): Promise<void> {
 		// Auth check
@@ -693,10 +920,16 @@ export class MobileServer {
 			return;
 		}
 		try {
+			this.agentStreaming = true;
 			const resp = await this.bridge!.prompt(p.message, p.images, p.streamingBehavior);
 			this.forwardRpcResponse(conn, id, resp);
 		} catch (err) {
 			this.sendError(conn, id, "internal", String(err));
+		} finally {
+			// Keep streaming flag on for a bit — agent_end event may arrive after prompt response
+			setTimeout(() => {
+				this.agentStreaming = false;
+			}, 2000);
 		}
 	}
 
@@ -987,7 +1220,8 @@ export class MobileServer {
 			} else if (path === "/api/abort" && req.method === "POST") {
 				this.sendRpcAsHttp(res, await this.bridge.abort());
 			} else {
-				this.sendJson(res, 404, { error: "Not found" });
+				// Fallback: serve static web files or 404
+				await this.serveStatic(req, res, path);
 			}
 		} catch (err) {
 			this.sendJson(res, 500, { error: String(err) });
@@ -1045,5 +1279,58 @@ export class MobileServer {
 			req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
 			req.on("error", reject);
 		});
+	}
+
+	// -----------------------------------------------------------------------
+	// Static file serving (SPA)
+	// -----------------------------------------------------------------------
+
+	private mimeTypes: Record<string, string> = {
+		".html": "text/html",
+		".js": "application/javascript",
+		".mjs": "application/javascript",
+		".css": "text/css",
+		".json": "application/json",
+		".png": "image/png",
+		".jpg": "image/jpeg",
+		".svg": "image/svg+xml",
+		".ico": "image/x-icon",
+		".woff": "font/woff",
+		".woff2": "font/woff2",
+		".webmanifest": "application/manifest+json",
+	};
+
+	private async serveStatic(_req: IncomingMessage, res: ServerResponse, urlPath: string): Promise<void> {
+		if (!this.webDir) {
+			this.sendJson(res, 404, { error: "Not found" });
+			return;
+		}
+
+		// Map URL path to file path. SPA: non-file paths serve index.html
+		let filePath: string;
+		if (urlPath === "/" || !extname(urlPath)) {
+			filePath = join(this.webDir, "index.html");
+		} else {
+			filePath = join(this.webDir, urlPath);
+		}
+
+		// Security: ensure path doesn't escape webDir
+		if (!filePath.startsWith(this.webDir)) {
+			this.sendJson(res, 403, { error: "Forbidden" });
+			return;
+		}
+
+		try {
+			if (!existsSync(filePath)) {
+				// SPA fallback for unknown files
+				filePath = join(this.webDir, "index.html");
+			}
+			const data = await readFile(filePath);
+			const mime = this.mimeTypes[extname(filePath)] || "application/octet-stream";
+			res.writeHead(200, { "Content-Type": mime });
+			res.end(data);
+		} catch {
+			this.sendJson(res, 404, { error: "Not found" });
+		}
 	}
 }

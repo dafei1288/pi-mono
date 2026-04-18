@@ -271,6 +271,8 @@ export const METHODS = {
 	GET_FORK_MESSAGES: "get_fork_messages",
 	// Commands
 	GET_COMMANDS: "get_commands",
+	// Directory browsing
+	BROWSE_DIRECTORY: "browse_directory",
 } as const;
 
 export type MethodName = (typeof METHODS)[keyof typeof METHODS];

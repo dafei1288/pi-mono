@@ -55,7 +55,12 @@ function cleanProps(props: any): any {
 
 export const View = React.forwardRef<HTMLDivElement, any>((props, ref) => {
   const { style, children, ...rest } = props;
-  return <div ref={ref} style={rnToCss(style)} {...cleanProps(rest)}>{children}</div>;
+  const css: any = rnToCss(style);
+  // RN View is a flex container when any flex props are present
+  const hasFlexProps = css.flex !== undefined || css.flexDirection || css.flexGrow !== undefined || css.flexShrink !== undefined || css.flexBasis !== undefined || css.justifyContent || css.alignItems || css.alignSelf || css.flexWrap;
+  if (hasFlexProps && !css.display) css.display = "flex";
+  if (css.display === "flex" && !css.flexDirection) css.flexDirection = "column";
+  return <div ref={ref} style={css} {...cleanProps(rest)}>{children}</div>;
 });
 
 export const Text = React.forwardRef<HTMLDivElement, any>((props, ref) => {
